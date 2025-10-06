@@ -70,12 +70,25 @@ parse_pom() {
 
     # Extraction de la version Spring Boot - méthode améliorée
     # 1. Chercher dans le parent
-    springboot_version=$(sed -n '/<parent>/,/<\/parent>/p' "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
+	springboot_version=""
+	if [ $(sed -n '/<parent>/,/<\/parent>/p' "$pom_file" | grep -c '<artifactId>spring-boot-starter-parent</artifactId>') -gt 0 ]; then
+		springboot_version=$(sed -n '/<parent>/,/<\/parent>/p' "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
+	fi
 
     # 2. Si pas trouvé, chercher dans les properties
     if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(grep -oP '(?<=<spring-boot\.version>)[^<]+' "$pom_file" 2>/dev/null)
+        springboot_version=$(grep -oP '(?<=<spring-boot.version>)[^<]+' "$pom_file" 2>/dev/null)
     fi
+	# 2-bis. Si pas trouvé, chercher dans les properties avec un point au lieu d'un tiré
+    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
+        springboot_version=$(grep -oP '(?<=<spring.boot.version>)[^<]+' "$pom_file" 2>/dev/null)
+    fi
+	
+	# 2-ter. Si pas trouvé, chercher dans les properties attachés
+    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
+        springboot_version=$(grep -oP '(?<=<springboot.version>)[^<]+' "$pom_file" 2>/dev/null)
+    fi
+
 
     # 3. Si toujours pas trouvé, chercher dans les dépendances spring-boot-starter
     if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
@@ -100,15 +113,25 @@ parse_pom() {
         IFS=',' read -ra LIB_ARRAY <<< "$LIBRARIES"
         for lib in "${LIB_ARRAY[@]}"; do
             lib_trimmed=$(echo "$lib" | xargs)  # Supprime les espaces
-
-            # Chercher la version de la librairie
-            lib_version=$(sed -n "/<artifactId>$lib_trimmed<\/artifactId>/,/<\/dependency>/p" "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
-
-            # Si pas trouvé directement, chercher dans les properties
+            
+            # chercher dans les properties
+            lib_version=$(grep -oP "(?<=<$lib_trimme\.version>)[^<]+" "$pom_file" 2>/dev/null)
+            # Si pas trouvé directement, chercher dans les properties en remplacant les tirets par des .
             if [ -z "$lib_version" ] || [ "$lib_version" = "" ]; then
-                lib_version=$(grep -oP "(?<=<$lib_trimmed\.version>)[^<]+" "$pom_file" 2>/dev/null)
+                lib_trimed_replace_dash="${lib_trimmed//-/.}"
+                lib_version=$(grep -oP "(?<=<$lib_trimed_replace_dash\.version>)[^<]+" "$pom_file" 2>/dev/null)
             fi
-
+            
+            # Chercher la version de la librairie dans les dependences
+            if [ -z "$lib_version" ] || [ "$lib_version" = "" ]; then
+                property=$(cat "$pom_file" | awk "/<artifactId>$lib_trimmed<\/artifactId>/,/<\/dependency>/"' {if($0 ~ /<version>/) {match($0, /\$\{([^}]+)\}/, a); print a[1]}}')
+                if [[ "$property" =~ ^[a-zA-Z.-]+$ ]]; then
+                    lib_version=$(cat "$pom_file" | awk -v prop="$property" "/<$property>/ {gsub(/.*<$property>|<\/$property>.*/,\"\"); print}")
+                else
+                    lib_version="$property"
+                fi
+            fi
+            
             if [ -n "$lib_version" ] && [ "$lib_version" != "" ]; then
                 summary_line="$summary_line | $lib_trimmed: $lib_version"
             else
@@ -254,6 +277,7 @@ get_repos() {
                 # Variables pour stocker les résumés
                 pom_summary=""
                 package_summary=""
+                pom_summary_app=""
 
                 # pom.xml à la racine
                 if download_file "$repo" "$default_branch" "pom.xml" "$repo_safe"; then
@@ -266,11 +290,7 @@ get_repos() {
                     # Renommer pour éviter l'écrasement
                     mv "$OUTPUT_DIR/$repo_safe/pom.xml" "$OUTPUT_DIR/$repo_safe/app_pom.xml" 2>/dev/null
                     echo "  📋 Analyse du app/pom.xml..."
-                    app_pom_summary=$(parse_pom "$OUTPUT_DIR/$repo_safe/app_pom.xml" "$repo | app " "$default_branch")
-                    # Prendre le résumé du app/pom.xml s'il existe
-                    if [ -n "$app_pom_summary" ]; then
-                        pom_summary="$app_pom_summary"
-                    fi
+                    pom_summary_app=$(parse_pom "$OUTPUT_DIR/$repo_safe/app_pom.xml" "$repo | app " "$default_branch")
                 fi
 
                 # package-lock.json à la racine
@@ -280,11 +300,13 @@ get_repos() {
                 fi
 
                 # Écriture de la ligne complète dans le summary
-                if [ -n "$pom_summary" ] && [ -n "$package_summary" ]; then
-                    echo "$pom_summary | $package_summary" >> "$SUMMARY_FILE"
-                elif [ -n "$pom_summary" ]; then
+                if [ -n "$pom_summary" ]; then
                     echo "$pom_summary" >> "$SUMMARY_FILE"
-                elif [ -n "$package_summary" ]; then
+                fi
+                if [ -n "$pom_summary_app" ]; then
+                    echo "$pom_summary_app" >> "$SUMMARY_FILE"
+                fi
+                if [ -n "$package_summary" ]; then
                     echo "$repo | $package_summary" >> "$SUMMARY_FILE"
                 fi
 
