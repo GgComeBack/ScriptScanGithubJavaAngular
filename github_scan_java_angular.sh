@@ -124,7 +124,8 @@ parse_pom() {
             
             # Chercher la version de la librairie dans les dependences
             if [ -z "$lib_version" ] || [ "$lib_version" = "" ]; then
-                property=$(cat "$pom_file" | awk "/<artifactId>$lib_trimmed<\/artifactId>/,/<\/dependency>/"' {if($0 ~ /<version>/) {match($0, /\$\{([^}]+)\}/, a); print a[1]}}')
+                lib_trimmed_protected=$(echo "$lib" | xargs | sed 's/\//\\\//g') #Remplace le caratere / par \/
+                property=$(cat "$pom_file" | awk "/<artifactId>$lib_trimmed_protected<\/artifactId>/,/<\/dependency>/"' {if($0 ~ /<version>/) {match($0, /\$\{([^}]+)\}/, a); print a[1]}}')
                 if [[ "$property" =~ ^[a-zA-Z.-]+$ ]]; then
                     lib_version=$(cat "$pom_file" | awk -v prop="$property" "/<$property>/ {gsub(/.*<$property>|<\/$property>.*/,\"\"); print}")
                 else
