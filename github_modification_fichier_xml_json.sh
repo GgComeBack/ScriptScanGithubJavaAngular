@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Script pour modifier des fichiers XML/JSON dans GitHub et créer une Pull Request
+# Version optimisée avec moins d'appels système
 # Usage: ./github_modification_fichier_xml_json.sh <config_file.json>
 
 set -e
@@ -15,7 +16,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Fonction d'affichage avec couleur
 log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
@@ -27,28 +28,18 @@ log_error() { echo -e "${RED}❌ $1${NC}"; }
 check_requirements() {
     local missing_tools=()
 
-    if ! command -v jq &> /dev/null; then
-        missing_tools+=("jq")
-    fi
-
-    if ! command -v xmlstarlet &> /dev/null; then
-        missing_tools+=("xmlstarlet")
-    fi
-
-    if ! command -v git &> /dev/null; then
-        missing_tools+=("git")
-    fi
-
-    if ! command -v curl &> /dev/null; then
-        missing_tools+=("curl")
-    fi
+    for tool in jq xmlstarlet git curl; do
+        if ! command -v $tool &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
 
     if [ ${#missing_tools[@]} -gt 0 ]; then
         log_error "Outils manquants: ${missing_tools[*]}"
         echo ""
         echo "Installation:"
-        echo "  Ubuntu/Debian: sudo apt-get install jq xmlstarlet git curl"
-        echo "  macOS: brew install jq xmlstarlet git curl"
+        echo "  Ubuntu/Debian: sudo apt-get install ${missing_tools[*]}"
+        echo "  macOS: brew install ${missing_tools[*]}"
         exit 1
     fi
 }
@@ -88,12 +79,6 @@ check_parameters() {
       "action": "add",
       "jq_path": ".features",
       "value": {"newFeature": true}
-    },
-    {
-      "file_path": "config/data.json",
-      "type": "json",
-      "action": "delete",
-      "jq_path": ".deprecated"
     }
   ]
 }
@@ -102,15 +87,14 @@ EOF
     fi
 }
 
-# Lecture de la configuration
+# Lecture de la configuration - optimisé avec un seul appel jq
 read_config() {
     log_info "Lecture de la configuration depuis $CONFIG_FILE"
 
-    REPO=$(jq -r '.repository' "$CONFIG_FILE")
-    BASE_BRANCH=$(jq -r '.base_branch' "$CONFIG_FILE")
-    NEW_BRANCH=$(jq -r '.new_branch' "$CONFIG_FILE")
-    PR_TITLE=$(jq -r '.pr_title' "$CONFIG_FILE")
-    PR_BODY=$(jq -r '.pr_body' "$CONFIG_FILE")
+    # Un seul appel jq pour extraire toutes les valeurs nécessaires
+    local config_data=$(jq -r '[.repository, .base_branch, .new_branch, .pr_title, .pr_body] | @tsv' "$CONFIG_FILE")
+
+    IFS=$'\t' read -r REPO BASE_BRANCH NEW_BRANCH PR_TITLE PR_BODY <<< "$config_data"
 
     if [ "$REPO" = "null" ] || [ "$BASE_BRANCH" = "null" ] || [ "$NEW_BRANCH" = "null" ]; then
         log_error "Configuration incomplète (repository, base_branch, new_branch requis)"
@@ -127,18 +111,12 @@ clone_repository() {
     mkdir -p "$TEMP_DIR"
     cd "$TEMP_DIR"
 
-    # Clone avec authentification
     git clone "https://oauth2:${GITHUB_TOKEN}@github.com/${REPO}.git" repo
     cd repo
 
-    # Configuration git
     git config user.name "GitHub Bot"
     git config user.email "bot@github.com"
-
-    # Checkout de la branche de base
     git checkout "$BASE_BRANCH"
-
-    # Création de la nouvelle branche
     git checkout -b "$NEW_BRANCH"
 
     log_success "Repository cloné et branche créée"
@@ -162,32 +140,26 @@ modify_xml_file() {
     case $action in
         "update")
             if [ -n "$attribute" ]; then
-                # Mise à jour d'un attribut
                 xmlstarlet ed -L -u "${xpath}/@${attribute}" -v "$value" "$file_path"
             else
-                # Mise à jour du contenu
                 xmlstarlet ed -L -u "$xpath" -v "$value" "$file_path"
             fi
             log_success "Valeur mise à jour"
             ;;
 
         "add")
-            # Ajout d'un nouvel élément
             local parent_xpath=$(dirname "$xpath" | sed 's|^\.||')
             local element_name=$(basename "$xpath")
-
             xmlstarlet ed -L -s "$parent_xpath" -t elem -n "$element_name" -v "$value" "$file_path"
             log_success "Élément ajouté"
             ;;
 
         "delete")
-            # Suppression d'un élément
             xmlstarlet ed -L -d "$xpath" "$file_path"
             log_success "Élément supprimé"
             ;;
 
         "add_attribute")
-            # Ajout d'un attribut
             xmlstarlet ed -L -i "$xpath" -t attr -n "$attribute" -v "$value" "$file_path"
             log_success "Attribut ajouté"
             ;;
@@ -199,7 +171,7 @@ modify_xml_file() {
     esac
 }
 
-# Modification d'un fichier JSON
+# Modification d'un fichier JSON - optimisé
 modify_json_file() {
     local file_path=$1
     local action=$2
@@ -217,18 +189,18 @@ modify_json_file() {
 
     case $action in
         "update")
-            # Mise à jour d'une valeur
-            if [[ "$value" =~ ^[0-9]+$ ]]; then
-                # Valeur numérique
+            # Détection automatique du type de valeur
+            if [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                # Nombre
                 jq "${jq_path} = ${value}" "$file_path" > "$temp_file"
             elif [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
-                # Valeur booléenne
+                # Booléen
                 jq "${jq_path} = ${value}" "$file_path" > "$temp_file"
             elif [[ "$value" =~ ^\{.*\}$ ]] || [[ "$value" =~ ^\[.*\]$ ]]; then
                 # Objet ou tableau JSON
                 jq "${jq_path} = ${value}" "$file_path" > "$temp_file"
             else
-                # Valeur string
+                # String
                 jq "${jq_path} = \"${value}\"" "$file_path" > "$temp_file"
             fi
             mv "$temp_file" "$file_path"
@@ -236,12 +208,9 @@ modify_json_file() {
             ;;
 
         "add")
-            # Ajout d'un élément
             if [[ "$value" =~ ^\{.*\}$ ]] || [[ "$value" =~ ^\[.*\]$ ]]; then
-                # Objet ou tableau
                 jq "${jq_path} += ${value}" "$file_path" > "$temp_file"
             else
-                # Valeur simple
                 jq "${jq_path} += [\"${value}\"]" "$file_path" > "$temp_file"
             fi
             mv "$temp_file" "$file_path"
@@ -249,14 +218,12 @@ modify_json_file() {
             ;;
 
         "delete")
-            # Suppression d'un élément
             jq "del(${jq_path})" "$file_path" > "$temp_file"
             mv "$temp_file" "$file_path"
             log_success "Élément supprimé"
             ;;
 
         "merge")
-            # Fusion d'objets
             jq "${jq_path} *= ${value}" "$file_path" > "$temp_file"
             mv "$temp_file" "$file_path"
             log_success "Objets fusionnés"
@@ -269,35 +236,38 @@ modify_json_file() {
     esac
 }
 
-# Application des modifications
+# Application des modifications - optimisé
 apply_modifications() {
     log_info "Application des modifications"
 
     local mod_count=$(jq '.modifications | length' "$CONFIG_FILE")
-    local i=0
 
-    while [ $i -lt $mod_count ]; do
-        local file_path=$(jq -r ".modifications[$i].file_path" "$CONFIG_FILE")
-        local file_type=$(jq -r ".modifications[$i].type" "$CONFIG_FILE")
-        local action=$(jq -r ".modifications[$i].action" "$CONFIG_FILE")
+    # Extraire toutes les modifications en une seule fois
+    local modifications=$(jq -c '.modifications[]' "$CONFIG_FILE")
+
+    local i=0
+    while IFS= read -r mod; do
+        i=$((i+1))
+
+        # Extraire les champs nécessaires en un seul appel jq
+        local mod_data=$(echo "$mod" | jq -r '[.file_path, .type, .action] | @tsv')
+        IFS=$'\t' read -r file_path file_type action <<< "$mod_data"
 
         echo ""
-        log_info "Modification $((i+1))/$mod_count: $file_path"
+        log_info "Modification $i/$mod_count: $file_path"
 
         case $file_type in
             "xml")
-                local xpath=$(jq -r ".modifications[$i].xpath" "$CONFIG_FILE")
-                local value=$(jq -r ".modifications[$i].value // empty" "$CONFIG_FILE")
-                local attribute=$(jq -r ".modifications[$i].attribute // empty" "$CONFIG_FILE")
-
+                local xpath=$(echo "$mod" | jq -r '.xpath')
+                local value=$(echo "$mod" | jq -r '.value // empty')
+                local attribute=$(echo "$mod" | jq -r '.attribute // empty')
                 modify_xml_file "$file_path" "$action" "$xpath" "$value" "$attribute"
                 ;;
 
             "json")
-                local jq_path=$(jq -r ".modifications[$i].jq_path" "$CONFIG_FILE")
-                local value=$(jq -c ".modifications[$i].value // empty" "$CONFIG_FILE")
+                local jq_path=$(echo "$mod" | jq -r '.jq_path')
+                local value=$(echo "$mod" | jq -c '.value // empty')
 
-                # Si value est un objet/tableau, on le garde tel quel, sinon on le traite comme string
                 if [ "$value" = "null" ] || [ -z "$value" ]; then
                     value=""
                 fi
@@ -309,9 +279,7 @@ apply_modifications() {
                 log_error "Type de fichier non supporté: $file_type"
                 ;;
         esac
-
-        i=$((i+1))
-    done
+    done <<< "$modifications"
 
     log_success "Toutes les modifications appliquées"
 }
@@ -320,32 +288,25 @@ apply_modifications() {
 commit_and_push() {
     log_info "Commit et push des changements"
 
-    # Vérifier s'il y a des changements
     if [ -z "$(git status --porcelain)" ]; then
         log_warning "Aucun changement détecté"
         return 1
     fi
 
-    # Afficher les fichiers modifiés
     echo ""
     log_info "Fichiers modifiés:"
     git status --short
     echo ""
 
-    # Ajouter tous les fichiers modifiés
     git add -A
-
-    # Commit
     git commit -m "$PR_TITLE"
-
-    # Push
     git push origin "$NEW_BRANCH"
 
     log_success "Changements poussés sur GitHub"
     return 0
 }
 
-# Création de la Pull Request
+# Création de la Pull Request - optimisé
 create_pull_request() {
     log_info "Création de la Pull Request"
 
@@ -362,18 +323,17 @@ create_pull_request() {
         "https://api.github.com/repos/${REPO}/pulls" \
         -d "$pr_data")
 
-    local pr_url=$(echo "$response" | jq -r '.html_url')
-    local pr_number=$(echo "$response" | jq -r '.number')
+    # Extraire url et number en un seul appel jq
+    local pr_info=$(echo "$response" | jq -r '[.html_url, .number, .message] | @tsv')
+    IFS=$'\t' read -r pr_url pr_number error_msg <<< "$pr_info"
 
     if [ "$pr_url" != "null" ] && [ -n "$pr_url" ]; then
         log_success "Pull Request créée avec succès!"
         echo ""
         echo "📋 PR #${pr_number}: $pr_url"
     else
-        local error_msg=$(echo "$response" | jq -r '.message // "Erreur inconnue"')
-        log_error "Échec de la création de la PR: $error_msg"
+        log_error "Échec de la création de la PR: ${error_msg:-Erreur inconnue}"
 
-        # Afficher plus de détails si disponibles
         if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
             echo "$response" | jq -r '.errors[] | "  - \(.message)"'
         fi
@@ -401,7 +361,6 @@ main() {
     check_parameters
     read_config
 
-    # Configuration du nettoyage en cas d'erreur
     trap cleanup EXIT
 
     clone_repository
