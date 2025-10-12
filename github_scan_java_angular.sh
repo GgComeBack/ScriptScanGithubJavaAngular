@@ -5,10 +5,10 @@
 # Usage: ./github_scan_java_angular.sh '' lombok,spring-data-r2dbc-dsl
 
 # Configuration
-GITHUB_TOKEN="${GITHUB_TOKEN:-}"  # Token d'authentification (optionnel mais recommandé)
-TARGET="${1:-}"  # Username ou organization passé en paramètre
-OUTPUT_DIR="./github_files"  # Répertoire de sortie pour les fichiers
-LIBRARIES="${2:-}"  # Liste de librairies séparées par des virgules (optionnel)
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+TARGET="${1:-}"
+OUTPUT_DIR="./github_files"
+LIBRARIES="${2:-}"
 
 # Vérification des paramètres
 if [ -z "$TARGET" ] && [ -z "$GITHUB_TOKEN" ]; then
@@ -52,7 +52,8 @@ else
 fi
 echo "" >> "$SUMMARY_FILE"
 
-# Fonction pour extraire des informations du pom.xml
+# Fonction optimisée pour extraire des informations du pom.xml
+# Utilise un seul passage avec awk pour extraire toutes les informations nécessaires
 parse_pom() {
     local pom_file=$1
     local repo_name=$2
@@ -62,89 +63,174 @@ parse_pom() {
         return
     fi
 
-    # Extraction de la version Java
-    java_version=$(grep -oP '(?<=<java\.version>)[^<]+' "$pom_file" 2>/dev/null || \
-                   grep -oP '(?<=<maven\.compiler\.source>)[^<]+' "$pom_file" 2>/dev/null || \
-                   grep -oP '(?<=<maven\.compiler\.target>)[^<]+' "$pom_file" 2>/dev/null || \
-                   echo "N/A")
-
-    # Extraction de la version Spring Boot - méthode améliorée
-    # 1. Chercher dans le parent
-	springboot_version=""
-	if [ $(sed -n '/<parent>/,/<\/parent>/p' "$pom_file" | grep -c '<artifactId>spring-boot-starter-parent</artifactId>') -gt 0 ]; then
-		springboot_version=$(sed -n '/<parent>/,/<\/parent>/p' "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
-	fi
-
-    # 2. Si pas trouvé, chercher dans les properties
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(grep -oP '(?<=<spring-boot.version>)[^<]+' "$pom_file" 2>/dev/null)
-    fi
-	# 2-bis. Si pas trouvé, chercher dans les properties avec un point au lieu d'un tiré
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(grep -oP '(?<=<spring.boot.version>)[^<]+' "$pom_file" 2>/dev/null)
-    fi
-	
-	# 2-ter. Si pas trouvé, chercher dans les properties attachés
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(grep -oP '(?<=<springboot.version>)[^<]+' "$pom_file" 2>/dev/null)
+    # Préparer la liste des librairies à rechercher
+    local lib_search=""
+    if [ -n "$LIBRARIES" ]; then
+        IFS=',' read -ra LIB_ARRAY <<< "$LIBRARIES"
+        for lib in "${LIB_ARRAY[@]}"; do
+            lib_trimmed=$(echo "$lib" | xargs)
+            lib_search="${lib_search}${lib_trimmed}|"
+        done
+        lib_search="${lib_search%|}"  # Supprimer le dernier |
     fi
 
+    # Un seul passage AWK pour tout extraire
+    local result=$(awk -v libs="$lib_search" '
+    BEGIN {
+        java_version = "N/A"
+        springboot_version = "N/A"
+        in_parent = 0
+        in_dependency = 0
+        current_artifactId = ""
+        split(libs, lib_array, "|")
+        for (i in lib_array) {
+            lib_versions[lib_array[i]] = "N/A"
+            lib_search_dash[lib_array[i]] = lib_array[i]
+            gsub(/-/, ".", lib_search_dash[lib_array[i]])
+        }
+    }
 
-    # 3. Si toujours pas trouvé, chercher dans les dépendances spring-boot-starter
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(sed -n '/<artifactId>spring-boot-starter/,/<\/dependency>/p' "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
-    fi
+    # Extraction Java version
+    /<java\.version>/ {
+        match($0, /<java\.version>([^<]+)/, arr)
+        if (arr[1] != "") java_version = arr[1]
+    }
+    /<maven\.compiler\.source>/ {
+        if (java_version == "N/A") {
+            match($0, /<maven\.compiler\.source>([^<]+)/, arr)
+            if (arr[1] != "") java_version = arr[1]
+        }
+    }
+    /<maven\.compiler\.target>/ {
+        if (java_version == "N/A") {
+            match($0, /<maven\.compiler\.target>([^<]+)/, arr)
+            if (arr[1] != "") java_version = arr[1]
+        }
+    }
 
-    # 4. Si toujours rien, chercher spring-boot-dependencies
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version=$(sed -n '/<artifactId>spring-boot-dependencies/,/<\/dependency>/p' "$pom_file" | grep -oP '(?<=<version>)[^<]+' | head -1 2>/dev/null)
-    fi
+    # Extraction Spring Boot version
+    /<parent>/ { in_parent = 1 }
+    /<\/parent>/ { in_parent = 0 }
 
-    # Valeur par défaut si toujours pas trouvé
-    if [ -z "$springboot_version" ] || [ "$springboot_version" = "" ]; then
-        springboot_version="N/A"
-    fi
+    in_parent && /<artifactId>spring-boot-starter-parent<\/artifactId>/ {
+        getline
+        while (getline && !/<\/parent>/) {
+            if (match($0, /<version>([^<]+)/, arr)) {
+                springboot_version = arr[1]
+                break
+            }
+        }
+    }
+
+    # Spring Boot dans properties
+    /<spring-boot\.version>/ {
+        if (springboot_version == "N/A") {
+            match($0, /<spring-boot\.version>([^<]+)/, arr)
+            if (arr[1] != "") springboot_version = arr[1]
+        }
+    }
+    /<spring\.boot\.version>/ {
+        if (springboot_version == "N/A") {
+            match($0, /<spring\.boot\.version>([^<]+)/, arr)
+            if (arr[1] != "") springboot_version = arr[1]
+        }
+    }
+    /<springboot\.version>/ {
+        if (springboot_version == "N/A") {
+            match($0, /<springboot\.version>([^<]+)/, arr)
+            if (arr[1] != "") springboot_version = arr[1]
+        }
+    }
+
+    # Extraction des versions de librairies
+    /<dependency>/ { in_dependency = 1; current_artifactId = ""; dep_version = "" }
+    /<\/dependency>/ {
+        if (in_dependency && current_artifactId != "" && dep_version != "") {
+            for (lib in lib_versions) {
+                if (current_artifactId == lib) {
+                    # Résoudre les propriétés ${...}
+                    if (match(dep_version, /\$\{([^}]+)\}/, prop_arr)) {
+                        lib_versions[lib] = "PROP:" prop_arr[1]
+                    } else {
+                        lib_versions[lib] = dep_version
+                    }
+                }
+            }
+        }
+        in_dependency = 0
+    }
+
+    in_dependency && /<artifactId>/ {
+        match($0, /<artifactId>([^<]+)/, arr)
+        current_artifactId = arr[1]
+    }
+
+    in_dependency && /<version>/ {
+        match($0, /<version>([^<]+)/, arr)
+        dep_version = arr[1]
+    }
+
+    # Extraction des versions depuis properties
+    {
+        for (lib in lib_versions) {
+            # Recherche avec tirets
+            pattern = "<" lib "\\.version>"
+            if (match($0, pattern)) {
+                match($0, pattern "([^<]+)", arr)
+                if (arr[1] != "" && lib_versions[lib] == "N/A") {
+                    lib_versions[lib] = arr[1]
+                }
+            }
+            # Recherche avec points
+            pattern_dash = "<" lib_search_dash[lib] "\\.version>"
+            if (match($0, pattern_dash)) {
+                match($0, pattern_dash "([^<]+)", arr)
+                if (arr[1] != "" && lib_versions[lib] == "N/A") {
+                    lib_versions[lib] = arr[1]
+                }
+            }
+        }
+    }
+
+    END {
+        print "JAVA:" java_version
+        print "SPRINGBOOT:" springboot_version
+        for (lib in lib_versions) {
+            print "LIB:" lib ":" lib_versions[lib]
+        }
+    }
+    ' "$pom_file")
+
+    # Résolution des propriétés référencées
+    local java_version=$(echo "$result" | grep "^JAVA:" | cut -d: -f2)
+    local springboot_version=$(echo "$result" | grep "^SPRINGBOOT:" | cut -d: -f2)
 
     # Construction de la ligne de résumé
     local summary_line="$repo_name | branch : $default_branch | Java: $java_version | Spring Boot: $springboot_version"
 
-    # Recherche des librairies Maven spécifiques
+    # Ajout des versions de librairies
     if [ -n "$LIBRARIES" ]; then
-        IFS=',' read -ra LIB_ARRAY <<< "$LIBRARIES"
-        for lib in "${LIB_ARRAY[@]}"; do
-            lib_trimmed=$(echo "$lib" | xargs)  # Supprime les espaces
-            
-            # chercher dans les properties
-            lib_version=$(grep -oP "(?<=<$lib_trimme\.version>)[^<]+" "$pom_file" 2>/dev/null)
-            # Si pas trouvé directement, chercher dans les properties en remplacant les tirets par des .
-            if [ -z "$lib_version" ] || [ "$lib_version" = "" ]; then
-                lib_trimed_replace_dash="${lib_trimmed//-/.}"
-                lib_version=$(grep -oP "(?<=<$lib_trimed_replace_dash\.version>)[^<]+" "$pom_file" 2>/dev/null)
-            fi
-            
-            # Chercher la version de la librairie dans les dependences
-            if [ -z "$lib_version" ] || [ "$lib_version" = "" ]; then
-                lib_trimmed_protected=$(echo "$lib" | xargs | sed 's/\//\\\//g') #Remplace le caratere / par \/
-                property=$(cat "$pom_file" | awk "/<artifactId>$lib_trimmed_protected<\/artifactId>/,/<\/dependency>/"' {if($0 ~ /<version>/) {match($0, /\$\{([^}]+)\}/, a); print a[1]}}')
-                if [[ "$property" =~ ^[a-zA-Z.-]+$ ]]; then
-                    lib_version=$(cat "$pom_file" | awk -v prop="$property" "/<$property>/ {gsub(/.*<$property>|<\/$property>.*/,\"\"); print}")
-                else
-                    lib_version="$property"
+        while IFS= read -r line; do
+            if [[ $line == LIB:* ]]; then
+                local lib_name=$(echo "$line" | cut -d: -f2)
+                local lib_version=$(echo "$line" | cut -d: -f3-)
+
+                # Résoudre les propriétés si nécessaire
+                if [[ $lib_version == PROP:* ]]; then
+                    local prop_name=${lib_version#PROP:}
+                    lib_version=$(grep -oP "(?<=<$prop_name>)[^<]+" "$pom_file" 2>/dev/null || echo "N/A")
                 fi
+
+                summary_line="$summary_line | $lib_name: $lib_version"
             fi
-            
-            if [ -n "$lib_version" ] && [ "$lib_version" != "" ]; then
-                summary_line="$summary_line | $lib_trimmed: $lib_version"
-            else
-                summary_line="$summary_line | $lib_trimmed: N/A"
-            fi
-        done
+        done <<< "$result"
     fi
 
     echo "$summary_line"
 }
 
-# Fonction pour extraire des informations du package-lock.json
+# Fonction optimisée pour extraire des informations du package-lock.json
+# Utilise un seul appel jq pour extraire toutes les informations
 parse_package_lock() {
     local package_file=$1
     local repo_name=$2
@@ -154,36 +240,37 @@ parse_package_lock() {
         return
     fi
 
-    local summary_line="$repo_name | branch : $default_branch"
-
-    # Extraction de la version Angular
-    angular_version=$(jq -r '.dependencies."@angular/core".version // .packages."node_modules/@angular/core".version // "N/A"' "$package_file" 2>/dev/null)
-    summary_line="$summary_line | Angular: $angular_version"
-
-    # Extraction de la version Vue
-    vue_version=$(jq -r '.dependencies.vue.version // .packages."node_modules/vue".version // "N/A"' "$package_file" 2>/dev/null)
-    summary_line="$summary_line | Vue: $vue_version"
-
-    # Extraction de la version React
-    react_version=$(jq -r '.dependencies.react.version // .packages."node_modules/react".version // "N/A"' "$package_file" 2>/dev/null)
-    summary_line="$summary_line | React: $react_version"
-
-    # Recherche des librairies NPM spécifiques
+    # Préparer le filtre jq pour les librairies personnalisées
+    local lib_filter=""
     if [ -n "$LIBRARIES" ]; then
         IFS=',' read -ra LIB_ARRAY <<< "$LIBRARIES"
         for lib in "${LIB_ARRAY[@]}"; do
-            lib_trimmed=$(echo "$lib" | xargs)  # Supprime les espaces
-
-            # Chercher dans dependencies ou packages
-            lib_version=$(jq -r ".dependencies.\"$lib_trimmed\".version // .packages.\"node_modules/$lib_trimmed\".version // \"N/A\"" "$package_file" 2>/dev/null)
-
-            if [ -n "$lib_version" ] && [ "$lib_version" != "N/A" ]; then
-                summary_line="$summary_line | $lib_trimmed: $lib_version"
-            else
-                summary_line="$summary_line | $lib_trimmed: N/A"
-            fi
+            lib_trimmed=$(echo "$lib" | xargs)
+            lib_filter="${lib_filter}, \"${lib_trimmed}\": (.dependencies.\"${lib_trimmed}\".version // .packages.\"node_modules/${lib_trimmed}\".version // \"N/A\")"
         done
     fi
+
+    # Un seul appel jq pour tout extraire
+    local result=$(jq -r "{
+        angular: (.dependencies.\"@angular/core\".version // .packages.\"node_modules/@angular/core\".version // \"N/A\"),
+        vue: (.dependencies.vue.version // .packages.\"node_modules/vue\".version // \"N/A\"),
+        react: (.dependencies.react.version // .packages.\"node_modules/react\".version // \"N/A\")${lib_filter}
+    } | to_entries | map(\"\(.key):\(.value)\") | join(\"|\")" "$package_file" 2>/dev/null)
+
+    if [ -z "$result" ]; then
+        return
+    fi
+
+    # Construction de la ligne de résumé
+    local summary_line="$repo_name | branch : $default_branch"
+
+    IFS='|' read -ra VERSIONS <<< "$result"
+    for version_pair in "${VERSIONS[@]}"; do
+        IFS=':' read -r key value <<< "$version_pair"
+        # Capitaliser la première lettre
+        key_display=$(echo "$key" | sed 's/^\(.\)/\U\1/')
+        summary_line="$summary_line | $key_display: $value"
+    done
 
     echo "$summary_line"
 }
@@ -225,11 +312,9 @@ get_repos() {
 
     # Détermination de l'URL API selon le contexte
     if [ -n "$GITHUB_TOKEN" ] && [ -z "$TARGET" ]; then
-        # Authentifié sans target = mes propres repos
         base_url="https://api.github.com/user/repos"
         echo "📦 Récupération de vos repositories (utilisateur authentifié)"
     elif [ -n "$TARGET" ]; then
-        # Target spécifié = repos d'un utilisateur/org spécifique
         base_url="https://api.github.com/users/$TARGET/repos"
         echo "📦 Récupération des repositories pour: $TARGET"
     else
@@ -308,7 +393,7 @@ get_repos() {
                     echo "$pom_summary_app" >> "$SUMMARY_FILE"
                 fi
                 if [ -n "$package_summary" ]; then
-                    echo "$repo | $package_summary" >> "$SUMMARY_FILE"
+                    echo "$package_summary" >> "$SUMMARY_FILE"
                 fi
 
                 # Nettoyage : suppression du répertoire du repo après traitement
